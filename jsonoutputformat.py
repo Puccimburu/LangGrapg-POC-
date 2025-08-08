@@ -608,6 +608,16 @@ def handle_follow_up_node(state: AgentState, mongodb_executor, llm):
             
             extracted_value = llm.invoke(extraction_prompt).content.strip().lower().replace("'", "").replace('"', '')
             logger.info(f"... Extracted value: '{extracted_value}'")
+            
+            # Implement fuzzy matching for role values
+            if "role" in query_str:
+                available_roles = ["admin", "user", "legal"]  # Known roles from the database
+                matched_role = fuzzy_match_role(extracted_value, available_roles)
+                if matched_role:
+                    logger.info(f"... Fuzzy matched '{extracted_value}' to '{matched_role}'")
+                    extracted_value = matched_role
+                else:
+                    logger.info(f"... No fuzzy match found for '{extracted_value}', using as-is")
 
             final_query_str = query_str.replace("<user_input_needed>", extracted_value)
             final_query = json.loads(final_query_str)
@@ -761,6 +771,50 @@ def json_converter(o):
     if isinstance(o, (datetime, ObjectId)):
         return str(o)
     raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+def fuzzy_match_role(user_input: str, available_roles: List[str]) -> Optional[str]:
+    """
+    Fuzzy match user input to available roles in the database.
+    Handles common variations like plural forms, synonyms, etc.
+    """
+    user_input = user_input.lower().strip()
+    
+    # Direct match first
+    if user_input in available_roles:
+        return user_input
+    
+    # Handle common variations
+    role_mappings = {
+        "admins": "admin",
+        "administrators": "admin", 
+        "administrator": "admin",
+        "admin user": "admin",
+        "admin role": "admin",
+        "users": "user",
+        "regular user": "user",
+        "user role": "user",
+        "legal team": "legal",
+        "legal role": "legal",
+        "lawyer": "legal",
+        "attorneys": "legal",
+        "attorney": "legal"
+    }
+    
+    # Check mappings
+    if user_input in role_mappings:
+        return role_mappings[user_input]
+    
+    # Check if user input contains any role name
+    for role in available_roles:
+        if role in user_input or user_input in role:
+            return role
+    
+    # Try to find partial matches (substring matching)
+    for role in available_roles:
+        if user_input.startswith(role[:3]) or role.startswith(user_input[:3]):
+            return role
+    
+    return None
 
 # ==============================================================================
 # WORKFLOW COMPILATION
