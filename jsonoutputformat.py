@@ -36,7 +36,7 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGener
 from langchain_community.vectorstores import Chroma
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator, field_validator
 
 print("🚀 ENHANCED LANGGRAPH RAG SYSTEM")
 print(f"✅ Gemini API Key: {'Present' if GEMINI_API_KEY else 'Missing'}")
@@ -265,6 +265,17 @@ class FollowUpSuggestion(BaseModel):
     follow_up_question: str = Field(description="A clear, concise, yes/no question to ask the user as a follow-up. Must be 'NONE' if no good follow-up exists.")
     contextual_query: Optional[Dict] = Field(None, description="The full MongoDB JSON query to be executed if the user answers 'yes'. Must be provided if follow_up_question is not 'NONE'.")
 
+    # NEW: This validator will automatically convert a JSON string into a dictionary.
+    @field_validator('contextual_query', mode='before')
+    @classmethod
+    def parse_query_from_string(cls, value):
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                raise ValueError("contextual_query is a string but not valid JSON")
+        return value
+
     @model_validator(mode='after')
     def check_query_if_question_exists(self) -> 'FollowUpSuggestion':
         if self.follow_up_question.upper() != 'NONE' and not self.contextual_query:
@@ -464,44 +475,67 @@ def generate_follow_up_node(state: AgentState, llm):
         state["follow_up_context"] = None
         return state
 
-    suggestion_llm = llm.with_structured_output(FollowUpSuggestion)
+    # Use a more powerful model for follow-up generation
+    follow_up_llm = ChatGoogleGenerativeAI(model="gemini-1.5-pro-latest", temperature=0, google_api_key=GEMINI_API_KEY)
+    suggestion_llm = follow_up_llm.with_structured_output(FollowUpSuggestion)
     
     # We'll give the LLM two attempts to get it right.
     for attempt in range(2):
         logger.info(f"... Follow-up generation attempt {attempt + 1}/2")
         
         # Construct the prompt for this attempt
-        prompt = f"""You are a data analysis assistant. Your task is to suggest a helpful follow-up action based on a user's query and the data they received.
+        prompt = f"""You are a data analysis assistant. Generate a follow-up suggestion based on user data.
 
-        **Chain of Thought Instructions:**
-        1.  **Analyze the Data:** Look at the `raw_data` provided. What are the common fields? Are there obvious ways to filter or aggregate this data that would be useful? For example, filtering by 'role', 'status', or grouping by a category.
-        2.  **Formulate a Question:** Based on your analysis, create a clear, simple `follow_up_question` that a user can answer with "yes" and some extra detail. The question should be a natural next step.
-        3.  **Construct the Query:** Create the corresponding `contextual_query` in MongoDB JSON format. This query MUST be able to answer the question you formulated. If the user needs to provide a value (like a specific role), use the placeholder "<user_input_needed>" in the query's value field.
-        4.  **Final Check:** If you were able to create both a valid question and a valid query, provide them. If not, you MUST set `follow_up_question` to "NONE".
+**CRITICAL REQUIREMENTS:**
+- You MUST provide BOTH follow_up_question AND contextual_query together, or set follow_up_question to "NONE"
+- The contextual_query must be a complete, valid MongoDB aggregation pipeline
+- Use "<user_input_needed>" placeholder when user input is required
 
-        **User's Original Question:**
-        "{state['question'].content}"
-        
-        **Data the User Received:**
-        {json.dumps(state.get("raw_data", "No data provided."), indent=2, default=json_converter)}
+**User's Question:** "{state['question'].content}"
 
-        **Example Output:**
-        {{
-          "follow_up_question": "Would you like to filter by a specific role?",
-          "contextual_query": {{
-            "collection": "users",
-            "pipeline": [
-              {{
-                "$match": {{
-                  "role": "<user_input_needed>"
-                }}
-              }}
-            ]
-          }}
-        }}
+**Raw Data Analysis:**
+{json.dumps(state.get("raw_data", [])[:3], indent=2, default=json_converter)}
 
-        Now, generate your suggestion.
-        """
+**VALID EXAMPLES:**
+
+Option 1 - Filter suggestion:
+{{
+  "follow_up_question": "Would you like to filter by a specific role?",
+  "contextual_query": {{
+    "collection": "users",
+    "pipeline": [
+      {{"$match": {{"role": "<user_input_needed>"}}}},
+      {{"$project": {{"firstName": 1, "lastName": 1, "emailId": 1, "role": 1}}}}
+    ]
+  }}
+}}
+
+Option 2 - Count/Group suggestion:
+{{
+  "follow_up_question": "Would you like to see a count by role?",
+  "contextual_query": {{
+    "collection": "users",
+    "pipeline": [
+      {{"$group": {{"_id": "$role", "count": {{"$sum": 1}}}}}},
+      {{"$sort": {{"count": -1}}}}
+    ]
+  }}
+}}
+
+Option 3 - No good follow-up:
+{{
+  "follow_up_question": "NONE",
+  "contextual_query": null
+}}
+
+**ANALYSIS STEPS:**
+1. Look at the raw data structure and fields available
+2. For users data: suggest role filtering, authSource filtering, or role counting
+3. For files data: suggest status filtering or type grouping  
+4. For costs data: suggest batch grouping or time filtering
+5. Create BOTH a question AND complete query, or set to "NONE"
+
+Generate your response following exactly one of the example formats above:"""
         
         try:
             suggestion = suggestion_llm.invoke(prompt)
@@ -510,7 +544,17 @@ def generate_follow_up_node(state: AgentState, llm):
             if suggestion.follow_up_question and suggestion.follow_up_question.upper() != "NONE":
                 logger.info(f"✅ Follow-up generated successfully on attempt {attempt + 1}.")
                 state["follow_up_question"] = suggestion.follow_up_question
-                state["follow_up_context"] = suggestion.contextual_query
+                
+                # Handle case where contextual_query might be a string instead of dict
+                contextual_query = suggestion.contextual_query
+                if isinstance(contextual_query, str):
+                    try:
+                        contextual_query = json.loads(contextual_query)
+                    except json.JSONDecodeError:
+                        logger.warning(f"⚠️ Failed to parse contextual_query as JSON: {contextual_query}")
+                        raise ValueError("Invalid contextual_query format")
+                
+                state["follow_up_context"] = contextual_query
                 return state # Success! Exit the node.
             else:
                 # The LLM decided there was no good follow-up. This is also a success.
