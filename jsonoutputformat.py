@@ -700,6 +700,19 @@ def format_output_node(state: AgentState, llm):
                 ]
             }},
             {{
+                "type": "chart",
+                "chartType": "pie",
+                "data": {{
+                    "labels": ["admin", "user", "legal"],
+                    "datasets": [
+                        {{
+                            "label": "User Count by Role",
+                            "data": [4.0, 1.0, 1.0]
+                        }}
+                    ]
+                }}
+            }},
+            {{
                 "type": "text",
                 "content": "Widget B is the top seller this quarter."
             }}
@@ -722,6 +735,15 @@ def format_output_node(state: AgentState, llm):
     4. If the data is just text, use a "text" component.
     5. If there is a follow-up question to ask the user, add it as a final "text" component.
     6. Generate ONLY the final JSON output containing a list of these components, following the example format precisely.
+    
+    CRITICAL CHART FORMATTING RULES:
+    - For PIE charts: Use separate arrays: {"labels": ["admin", "user", "legal"], "datasets": [{"data": [4, 1, 1]}]}
+    - For BAR/LINE charts: Same format as pie charts with matching array lengths
+    - ALWAYS ensure labels array length EXACTLY matches data array length
+    - Extract labels from data: if data is [{"role": "admin", "count": 4}], labels should be ["admin"]
+    - Extract values from data: if data is [{"role": "admin", "count": 4}], values should be [4]
+    - NEVER use object arrays like [{"role": "admin", "count": 4}] directly in chart data
+    - Line charts should only be used for time-series or continuous data, NOT categorical data
     """
     
     try:
