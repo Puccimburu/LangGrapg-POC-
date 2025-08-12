@@ -24,7 +24,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://127.0.0.1:27017/genaiexeco-development")
 
 if not GEMINI_API_KEY:
-    raise ValueError("❌ Please set GEMINI_API_KEY in .env file")
+    raise ValueError("❌ Please set GEMINI_API_KEY in .env filee")
 
 # Core imports
 import pymongo
