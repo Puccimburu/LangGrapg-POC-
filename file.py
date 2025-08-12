@@ -24,7 +24,7 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MONGODB_URI = os.getenv("MONGODB_URI", "mongodb://127.0.0.1:27017/genaiexeco-development")
 
 if not GEMINI_API_KEY:
-    raise ValueError("❌ Please set GEMINI_API_KEY in .env filee")
+    raise ValueError("[ERROR] Please set GEMINI_API_KEY in .env filee")
 
 # Core imports
 import pymongo
@@ -35,16 +35,73 @@ from langchain.schema import Document
 from langchain_google_genai import GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI
 from langchain_community.vectorstores import Chroma
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.mongodb import MongoDBSaver
 from pydantic import BaseModel, Field, model_validator, field_validator
+from typing import Any
 
 print("ENHANCED LANGGRAPH RAG SYSTEM")
-print(f"✅ Gemini API Key: {'Present' if GEMINI_API_KEY else 'Missing'}")
-print(f"✅ MongoDB URI: {MONGODB_URI}")
+print(f"[OK] Gemini API Key: {'Present' if GEMINI_API_KEY else 'Missing'}")
+print(f"[OK] MongoDB URI: {MONGODB_URI}")
 
 # ==============================================================================
 # CORE COMPONENTS
 # ==============================================================================
+
+# Custom MongoDB Saver with Timestamps  
+class TimestampedMongoDBSaver(MongoDBSaver):
+    def __init__(self, *args, **kwargs):
+        # Call parent constructor
+        super().__init__(*args, **kwargs)
+        # Store reference to database and collection names for our custom methods
+        self.db_name = kwargs.get('db_name', 'checkpointing_db') 
+        self.checkpoint_collection_name = kwargs.get('checkpoint_collection_name', 'checkpoints')
+    
+    def put(self, config, checkpoint, metadata, new_versions):
+        """Override put method to add timestamp fields"""
+        # Call parent's put method first
+        result = super().put(config, checkpoint, metadata, new_versions)
+        
+        # After saving, add timestamp directly to the document
+        try:
+            # Access the collections using stored names
+            db = self.client[self.db_name]
+            checkpoint_collection = db[self.checkpoint_collection_name]
+            
+            # Add created_at field to the document
+            thread_id = config.get("configurable", {}).get("thread_id")
+            
+            # Extract checkpoint ID (checkpoint is a dict with 'id' key)
+            checkpoint_id = None
+            if isinstance(checkpoint, dict) and 'id' in checkpoint:
+                checkpoint_id = checkpoint['id']
+            elif hasattr(checkpoint, 'id'):
+                checkpoint_id = checkpoint.id
+            else:
+                # Skip timestamp addition if we can't extract ID
+                logger.debug(f"Could not extract checkpoint ID from {type(checkpoint)}")
+                return result
+            
+            if thread_id and checkpoint_id:
+                # Update the document with timestamp
+                update_result = checkpoint_collection.update_one(
+                    {
+                        "thread_id": thread_id,
+                        "checkpoint_id": checkpoint_id
+                    },
+                    {
+                        "$set": {
+                            "created_at": datetime.now(),
+                            "updated_at": datetime.now()
+                        }
+                    }
+                )
+                if update_result.modified_count > 0:
+                    logger.debug(f"Added timestamp to checkpoint {checkpoint_id}")
+                    
+        except Exception as e:
+            logger.warning(f"Failed to add timestamp to checkpoint: {e}")
+        
+        return result
 
 # MongoDB Executor (Simplified)
 class MongoDBExecutor:
@@ -115,75 +172,478 @@ def setup_ai_components():
 
 CORE COLLECTIONS WITH DETAILED SCHEMAS:
 
-1. USERS COLLECTION (6 users)
-- userId (String, UUID): Primary key, referenced by all other collections
-- emailId (String): Unique email, login identifier (e.g., @execo.com domain)
-- firstName, lastName (String): User names
-- role (String): "admin" or "user" - critical for filtering admin users
-- authSource (String): "google" or "self" authentication method
-- googleId (String/Float): Google OAuth identifier
-- createdAt, updatedAt (Date/String): Timestamp tracking
+The costevalutionforllm collection stores the cost and usage details for individual LLM (Large Language Model) API calls. Each document within this collection represents a single call and contains metrics like token usage and cost.
 
-2. FILES COLLECTION (98 documents)
-- fileId (String): Primary key, referenced by extractions and costs
-- fileName (String): Original file name with extension
-- status (String): "Created", "Processed", "Failed"
-- container, blobName, url (String): Storage location details
-- size (Number): File size in bytes
-- additionalFields (Object): Contains AI processing results
-  - classificationType: Document type (e.g., "Master Services Agreement")
-  - confidenceScore: Classification confidence
-  - complianceOutput: GDPR/DORA compliance results JSON
-  - totalCostPerFileIdInUSD: Processing cost per file
-  - totalInputTokens, totalOutputTokens: Token usage
+Schema Details
+1. _id (ObjectId)
+	• Description: A unique identifier automatically generated by MongoDB for each document.
+	• Type: ObjectId
+	• Required: Yes
+2. batchId (String)
+	• Description: A reference to a batch of uploaded files. This field links a specific LLM call to its larger processing context. It corresponds to the _id in a separate batches collection.
+	• Type: String
+	• Required: Yes
+	• Index: Recommended for efficient lookups and grouping.
+3. fileId (String)
+	• Description: A reference to a specific file within a batch. This field links the LLM call to the original file it was processing. It corresponds to the _id in a separate files collection.
+	• Type: String
+	• Required: Yes
+	• Index: Recommended for efficient lookups and grouping.
+4. promptId (String)
+	• Description: A reference to the specific prompt used for the LLM call. This field helps in analyzing the cost and performance of different prompts. It corresponds to the _id in a separate prompts collection.
+	• Type: String
+	• Required: Yes
+	• Index: Recommended for efficient lookups and grouping.
+5. inputTokens (Number)
+	• Description: The number of tokens in the input prompt sent to the LLM.
+	• Type: Number (Integer)
+	• Required: Yes
+6. outputTokens (Number)
+	• Description: The number of tokens in the response generated by the LLM.
+	• Type: Number (Integer)
+	• Required: Yes
+7. totalTokens (Number)
+	• Description: The sum of inputTokens and outputTokens, representing the total tokens consumed by a single LLM call.
+	• Type: Number (Integer)
+	• Required: Yes
+8. totalCostInUSD (Number)
+	• Description: The monetary cost of the LLM call, calculated in US dollars. This is a crucial metric for cost analysis.
+	• Type: Number (Double or Decimal)
+	• Required: Yes
 
-3. PROMPTS COLLECTION (AI instruction library)
-- promptId (String): Primary key, referenced by documentmappings
-- promptName (String): Human-readable name (e.g., "Term And Duration")
-- promptType (String): "Attribute" or "Clause"
-- promptText (String): Complete AI instructions for extraction
-- description (String): Brief explanation of prompt purpose
-- isSeeded (Boolean): Flag for initial system prompts
 
-4. BATCHES COLLECTION (Processing jobs)
-- batchId (String): Primary key, referenced by costs
-- batchName (String): Human names like "MSA 3", "NDA test"
-- status (String): "Processed", "Processing", "Failed", "Queued"
-- files (Array): Contains fileId, fileName, totalTimeTakenByFile
-- totalTimeTakenByBatch (String): Processing time with units
+LLM Pricing Schema -- llmpricing collection
 
-5. DOCUMENTEXTRACTIONS COLLECTION (2,600+ extractions)
-- value (String): Extracted content from documents
-- name (String): Extraction field name
-- confidenceScore (Number): AI confidence (0-100, >90 is high confidence)
-- type (String): "Attribute", "Clause", "Entity"
-- reasoning (String): AI explanation for extraction
-- citation (String): Source location in document
-- batchId, fileId, promptId (String): References to parent records
+The llmpricing collection stores the pricing and rate information for various Large Language Models (LLMs). Each document within this collection represents a specific model variant and its associated costs for token processing. This collection is used as a reference to calculate the total cost of LLM API calls.
 
-6. COSTEVALUTIONFORLLM COLLECTION (Cost tracking)
-- batchId, fileId, promptId (String): References for cost attribution
-- inputTokens, outputTokens, totalTokens (Number): Token consumption
-- totalCostInUSD (Number): Monetary cost in USD for cost analysis
+Schema Details
+	1. _id (ObjectId)
+		○ Description: A unique identifier automatically generated by MongoDB for each document.
+		○ Type: ObjectId
+		○ Required: Yes
+	2. modelVariant (String)
+		○ Description: The specific name or version of the Large Language Model, such as 'Google Gemini 1.5 flash' or 'OpenAI GPT-4o mini'. This field acts as the primary key for looking up a model's pricing.
+		○ Type: String
+		○ Required: Yes
+		○ Index: Recommended. A unique index should be created on this field to ensure fast, unique lookups and prevent duplicate entries for the same model.
+	3. ratePerMillionInputTokens (Number)
+		○ Description: The cost in US dollars (USD) for processing one million input tokens for the given modelVariant.
+		○ Type: Number (Double or Decimal128 for high precision financial calculations)
+		○ Required: Yes
+	4. ratePerMillionOutputTokens (Number)
+		○ Description: The cost in US dollars (USD) for generating one million output tokens from the given modelVariant.
+		○ Type: Number (Double or Decimal128 for high precision financial calculations)
+		○ Required: Yes
 
-7. LLMPRICING COLLECTION (3 pricing tiers)
-- modelVariant (String): Model names like "Google Gemini 1.5 flash"
-- ratePerMillionInputTokens, ratePerMillionOutputTokens (Number): Pricing rates
 
-8. OBLIGATIONEXTRACTIONS COLLECTION (488 obligations)
-- obligationExtractionId (String): Primary key
-- name, description (String): Legal obligation details
-- metadata (Object): Contains frequency, criticality, financial impact
+Users Schema
 
-9. DOCUMENTMAPPINGS COLLECTION (11 mappings)
-- sysId (String): Primary key
-- documentId (String): Document reference
-- promptIds (Array): Array of prompt IDs (up to 87 prompts per mapping)
+The "users" collection is a core component of the application, managing user identities, authentication credentials, and profile information. Each document represents a single user, storing details necessary for account access, personalization, and tracking user activity across the platform. This collection serves as the master source for user data and is referenced by numerous other collections to attribute actions and manage permissions.
 
-10. DOCUMENTTYPES COLLECTION (Classification vocabulary)
-- documentId (String): Primary key
-- documentType (String): Categories like "Share Purchase Agreement"
-- description (String): Detailed type description
+Schema Details
+
+	1. googleId (String, Float)
+	Description: The unique identifier provided by Google for users who authenticate via Google OAuth. This field will be null or NaN for users who sign up directly.
+	Type: String or Float (due to NaN values from data import)
+	Required: No
+
+	2. authSource (String)
+Description: The authentication method used by the user. Common values are "google" for Google OAuth or "self" for email/password-based registration.
+Type: String
+Required: Yes
+
+	3. createdAt (Date, String)
+Description: The date and time when the user account was created.
+Type: Date or String (due to data format inconsistencies, e.g., "2025-07-16T12:03:42.196Z").
+Required: Yes
+
+	4. emailId (String)
+Description: The user's unique email address, which serves as a primary login identifier.
+Type: String
+Required: Yes
+Index: A unique index is enforced on this field to prevent duplicate accounts.
+	
+	5. firstName (String)
+Description: The first name of the user.
+Type: String
+Required: Yes
+
+	6. lastName (String)
+Description: The last name of the user.
+Type: String
+Required: Yes
+
+	7. role (String)
+Description: The role assigned to the user within the application, which determines their permissions (e.g., "admin").
+Type: String
+Required: Yes
+Index: Recommended for efficiently querying users by role.
+
+	8. updatedAt (Date, String)
+Description: The date and time when the user's record was last updated.
+Type: Date or String (due to data format inconsistencies).
+Required: Yes
+
+	9. userId (String)
+Description: A unique application-level identifier (UUID) for the user. This is the primary key used to reference the user in other collections.
+Type: String
+Required: Yes
+Index: A unique index is enforced on this field to ensure data integrity and fast lookups.
+
+Relationships from other collections
+
+Referenced By: The users collection is a master data source. Its userId is used as a foreign key in many other collections to track creation and modification actions:
+files: createdBy and updatedBy fields.
+batches: createdBy and updatedBy fields.
+compliances: createdBy and updatedBy fields.
+conversations: userId, createdBy, and updatedBy fields.
+asks: createdBy and updatedBy fields.
+documenttypes: createdBy and updatedBy fields.
+documentmappings: createdBy and updatedBy fields.
+
+
+Document Types Schema
+The documenttypes collection functions as a master definition list or a controlled vocabulary for classifying documents within the application. Each entry in this collection defines a specific type of document, such as "Share Purchase Agreement" or "Data Centre Agreement". This provides a standardized set of categories that can be used by the AI for classification and by users for filtering and organization.
+
+Schema Details
+
+	1. documentId (String)
+Description: A unique application-level identifier (UUID) for the document type definition itself. This serves as the primary business key for this entry.
+Type: String
+Required: Yes
+Index: Recommended with a unique constraint to prevent duplicate document type definitions.
+
+	2. description (String)
+Description: A detailed description of the document type, which may include key identifiers or characteristics of the document category.
+Type: String
+Required: Yes
+
+	3. documentType (String)
+Description: The official, human-readable name of the document category (e.g., "Share Purchase Agreement", "Classification"). This is the label used for classification throughout the application.
+Type: String
+Required: Yes
+Index: Recommended for efficiently searching or grouping by type.
+
+	4. createdBy (String)
+Description: A reference to the user who created this document type definition. This field corresponds to the userId in the users collection.
+Type: String
+Required: Yes
+
+	5. updatedBy (String)
+Description: A reference to the user who last modified this document type definition. This field corresponds to the userId in the users collection.
+Type: String
+Required: Yes
+
+	6. createdAt (String)
+Description: The date and time when the document type was created, stored in ISO 8601 string format.
+Type: String
+Required: Yes
+Format: ISO 8601 datetime string (e.g., "2025-07-14T11:50:58.875Z").
+
+	7. updatedAt (String)
+Description: The date and time when the document type was last modified, stored in ISO 8601 string format.
+Type: String
+Required: Yes
+Format: ISO 8601 datetime string (e.g., "2025-07-02T17:05:11.029Z").
+
+Relationships
+Referenced By: This collection acts as a master data source. 
+documentmappings collection have a reference to documentId. This collection stores all the prompts linked to this document type. One document type can be linked to multiple prompts.
+
+While not directly referenced via a foreign key in other collections in the database schema, its documentType values are used by the application logic and are populated in the files. additionalFields.classificationType field after a document is processed.
+
+
+Document Mappings Schema
+
+The documentmappings collection stores the relationships between document types and the AI processing prompts used to extract information from them. Each document within this collection represents a mapping configuration that defines which prompts should be applied to specific documents during processing. This collection is essential for controlling and tracking the document analysis workflow.
+Schema Details
+
+sysId (String)
+Description: A unique system identifier for the document mapping entry. This serves as the primary business key for referencing this specific mapping configuration across the system.
+Type: String
+Required: Yes
+Index: Recommended with unique constraint for efficient lookups and preventing duplicate mappings.
+
+documentId (String)
+Description: A reference to the specific document that this mapping applies to. This identifier links the mapping to a document in the document management system and determines which document will be processed with the associated prompts.
+Type: String
+Required: Yes
+Index: Recommended for efficient document-based queries and analysis.
+
+promptIds (Array)
+Description: An array of prompt identifiers that should be applied to the specified document. Each prompt ID corresponds to a promptId in the prompts collection. This field can contain multiple prompts (e.g., 87 prompts) allowing comprehensive document analysis with various extraction rules.
+Type: Array
+Required: Yes
+References: prompts.promptId
+Index: Recommended for prompt-based analysis and optimization.
+
+createdBy (String)
+Description: A reference to the user who created this document mapping configuration. This field corresponds to the userId in the users collection and enables tracking of who configured specific document processing workflows.
+Type: String
+Required: Yes
+Index: Recommended for user-based analysis and audit trails.
+
+updatedBy (String)
+Description: A reference to the user who last modified this document mapping. This field corresponds to the userId in the users collection and tracks configuration change history.
+Type: String
+Required: Yes
+Index: Recommended for audit trail and modification tracking.
+
+createdAt (String)
+Description: The date and time when the document mapping was created, stored in ISO 8601 string format. This enables temporal analysis of mapping configuration history.
+Type: String
+Required: Yes
+Format: ISO 8601 datetime string (e.g., "2025-07-03T11:00:54.712Z")
+
+updatedAt (String)
+Description: The date and time when the document mapping was last modified, stored in ISO 8601 string format. This tracks the most recent changes to the mapping configuration.
+Type: String
+Required: Yes
+Format: ISO 8601 datetime string (e.g., "2025-07-03T11:00:54.712Z")
+
+Additional Index Information
+Composite Index (documentId_promptId): A compound index on documentId and promptId fields is recommended with unique constraint to prevent duplicate prompt assignments to the same document, ensuring data integrity in the mapping configuration.
+
+Batches Schema
+
+The batches collection stores information about batch processing jobs for document workflows. Each document within this collection represents a single batch operation that processes multiple files together, containing timing information, status tracking, and user attribution. This collection is used for monitoring processing performance and analyzing workflow efficiency.
+Schema Details
+
+batchId (String)
+
+Description: A unique identifier for the batch processing job, used to reference this batch across other collections. This field serves as the primary business key for batch operations.
+Type: String
+Required: Yes
+Index: Recommended with unique constraint for efficient lookups and preventing duplicates.
+
+
+batchName (String)
+
+Description: A human-readable name for the batch, such as "MSA 3", "NDA test", or "Compliance Review Batch". This helps users identify and distinguish between different batch operations.
+Type: String
+Required: Yes
+
+
+description (String)
+
+Description: A detailed description of the batch processing job, explaining its purpose or containing additional context. This field may be empty for simple batch operations.
+Type: String
+Required: Yes
+
+
+files (Array)
+
+Description: An array of file objects contained within this batch. Each file object includes fileId, fileName, and processing time information (totalTimeTakenByFile). This represents all documents processed together in this batch.
+Type: Array
+Required: Yes
+Structure: Array of objects with fileId, fileName, and timing data
+
+
+status (String)
+
+Description: The current processing status of the batch. Common values include "Processed", "Processing", "Failed", and "Queued". This field tracks the batch through its lifecycle.
+Type: String
+Required: Yes
+Index: Recommended for filtering batches by processing status.
+
+
+createdBy (String)
+
+Description: A reference to the user who initiated this batch processing job. This field corresponds to the userId in the users collection and enables user-based analytics.
+Type: String
+Required: Yes
+Index: Recommended for user-based analysis and activity tracking.
+
+updatedBy (String)
+
+Description: A reference to the user who last modified this batch record. This field corresponds to the userId in the users collection and tracks batch modification history.
+Type: String
+Required: Yes
+Index: Recommended for audit trail and user activity analysis.
+
+
+createdAt (Date)
+
+Description: The date and time when the batch was created and initiated, stored in ISO 8601 format. This enables time-based analysis and processing trends.
+Type: Date
+Required: Yes
+Index: Recommended for temporal analysis and date range queries.
+
+
+updatedAt (Date)
+
+Description: The date and time when the batch record was last modified, stored in ISO 8601 format. This tracks the most recent changes to the batch status or information.
+Type: Date
+Required: Yes
+Index: Recommended for tracking recent activity and modifications.
+
+
+totalTimeTakenByBatch (String)
+
+Description: The total processing time for the entire batch, typically formatted as a string with units (e.g., "247.35 secs", "7934.26 secs"). This metric is crucial for performance analysis and optimization.
+Type: String
+Required: No
+Format: Numeric value followed by time unit (usually "secs")
+
+Relationship: 
+
+fileId is primary key in the files collection. 
+
+Files Schema
+
+The files collection serves as the central metadata repository for every document uploaded to the system. Each document within this collection represents a single file, containing essential information such as its storage location, processing status, and the results of various AI analyses which are stored in a nested additionalFields object. This collection is fundamental for tracking a document throughout its entire lifecycle.
+
+Schema Details
+
+fileId (String)
+Description: A unique business identifier for the file. This ID is used across the application to reference this specific file in other collections.
+Type: String
+Required: Yes
+Index: Recommended with a unique constraint to ensure fast, unique lookups and data integrity.
+
+fileName (String)
+Description: The original name of the uploaded file, including its extension (e.g., "POC_TEST_LicenseAgreement.pdf").
+Type: String
+Required: Yes
+
+container (String)
+Description: The name of the storage container where the file is located, typically in a cloud storage service.
+Type: String
+Required: Yes
+
+blobName (String)
+Description: The full path or name of the file within the storage container, often including the fileId to ensure uniqueness.
+Type: String
+Required: Yes
+
+url (String)
+Description: A direct, often temporary or signed, URL to access the file in its storage location.
+Type: String
+Required: Yes
+
+size (Number)
+Description: The size of the file in bytes.
+Type: Number (Integer)
+Required: Yes
+
+status (String)
+Description: The current processing status of the file within the workflow (e.g., "Created", "Processed", "Failed").
+Type: String
+Required: Yes
+Index: Recommended for efficiently querying files based on their processing state.
+
+createdBy (String)
+Description: A reference to the user who uploaded the file. This field corresponds to the userId in the users collection.
+Type: String
+Required: Yes
+Index: Recommended for tracking user activity.
+
+updatedBy (String)
+Description: A reference to the user who last modified the file's record. This corresponds to the userId in the users collection.
+Type: String
+Required: Yes
+
+createdAt (Date)
+Description: The date and time when the file record was created, stored in ISO 8601 format.
+Type: Date
+Required: Yes
+Index: Recommended for temporal analysis.
+
+updatedAt (Date)
+Description: The date and time when the file record was last updated, stored in ISO 8601 format.
+Type: Date
+Required: Yes
+
+additionalFields (Object)
+Description: A nested object containing key-value pairs of data generated from various AI processing pipelines, such as classification, compliance checks, and cost analysis.
+Type: Object
+Required: Yes
+Sub-Fields:
+complianceOutput (String): A JSON string detailing results from compliance checks (e.g., GDPR, DORA).
+classificationType (String): The document type as determined by the classification agent (e.g., "Master Services Agreement").
+confidenceScore (Number): The confidence score of the classification.
+language (String): The detected language of the document.
+output (String): A JSON string containing the primary extraction results.
+totalCostPerFileIdInUSD (String): The total calculated cost for processing this file.
+totalInputTokens / totalOutputTokens (String): The total tokens consumed during the file's processing.
+
+Relationships
+Referenced By: The files collection is a central hub and its fileId is referenced by:
+documentextractions: To link each extraction back to its source file.
+obligationmappings: To map extracted obligations to their source file.
+costevalutionforllm: To attribute processing costs to a specific file.
+batches: The files array within a batch document contains references to the files processed in that batch.
+
+Prompts Schema
+
+The prompts collection serves as a centralized library for all AI instructions used in the document analysis platform. Each document within this collection represents a specific, reusable prompt designed to perform a particular task, such as extracting an attribute or identifying a clause. This collection is critical for standardizing and managing the AI's behavior across different document processing workflows.
+
+Schema Details
+
+promptId (String)
+Description: A unique business identifier for the prompt. This ID is used as a foreign key by other collections, like documentmappings, to reference a specific set of instructions.
+Type: String
+Required: Yes
+Index: Recommended with a unique constraint to ensure fast, unique lookups and prevent duplicate prompts.
+
+promptName (String)
+Description: A human-readable name for the prompt that summarizes its purpose, such as "Disclosing Party Jurisdiction of Incorporation " or "Perpetual Confidentiality ".
+Type: String
+Required: Yes
+Index: Recommended for easy searching and management of prompts.
+
+description (String)
+Description: A brief explanation of what the prompt is designed to achieve or what question it answers (e.g., "Under which jurisdiction's laws is the disclosing party incorporated or organised?").
+Type: String
+Required: Yes
+
+promptType (String)
+Description: The category of the prompt, which dictates the nature of the extraction task. Common values are "Attribute" or "Clause".
+Type: String
+Required: Yes
+Index: Recommended for grouping and filtering prompts by their function.
+
+promptText (String)
+Description: The detailed and complete text of the instructions provided to the Large Language Model. This text includes the objective, output format rules, definitions, keywords, and specific scenarios to guide the AI in performing its task accurately.
+Type: String
+Required: Yes
+
+createdBy (String)
+Description: A reference to the user or system that created the prompt.
+Type: String
+Required: Yes
+
+updatedBy (String)
+Description: A reference to the user or system that last modified the prompt.
+Type: String
+Required: Yes
+
+createdAt (String)
+Description: The date and time when the prompt was created, stored in ISO 8601 string format.
+Type: String
+Required: Yes
+Format: ISO 8601 datetime string (e.g., "2025-06-13T17:10:05.008Z").
+
+updatedAt (String)
+Description: The date and time when the prompt was last modified, stored in ISO 8601 string format.
+Type: String
+Required: Yes
+Format: ISO 8601 datetime string (e.g., "2025-06-13T17:10:05.008Z").
+
+promptVariables (Float)
+Description: A field intended to hold dynamic variables for the prompt. Based on the sample data, this field is not currently in use (value is NaN).
+Type: Float
+Required: Yes
+
+isSeeded (Boolean)
+Description: A flag to indicate if the prompt is part of the initial "seeded" data set provided with the application.
+Type: Boolean
+Required: Yes
+
+Relationships
+Referenced By: The prompts collection is a master data source and its promptId is referenced by:
+documentmappings: The promptIds array directly links a set of prompts to a specific document for processing.
+costevalutionforllm: To link the cost of an AI call back to the specific prompt that was executed.
 
 QUERY PATTERNS FOR BUSINESS INTELLIGENCE:
 
@@ -723,8 +1183,8 @@ def format_output_node(state: AgentState, llm):
     USER'S QUESTION:
     "{state['question'].content}"
 
-    RAW DATA (in Python/JSON format):
-    {json.dumps(raw_data, indent=2, default=json_converter)}
+    RAW DATA (in Python/JSON format - LIMITED TO FIRST 10 ITEMS):
+    {json.dumps(raw_data[:10] if isinstance(raw_data, list) else raw_data, indent=2, default=json_converter)}
 
     Follow-up question to include (if any): "{state.get('follow_up_question', 'NONE')}"
 
@@ -846,6 +1306,14 @@ def create_workflow():
     logger.info("🔧 Building structured output workflow...")
     retriever, llm, rag_chain = setup_ai_components()
     mongodb_executor = MongoDBExecutor()
+
+    mongo_client = pymongo.MongoClient(MONGODB_URI)
+    checkpointer = TimestampedMongoDBSaver(
+        client=mongo_client,
+        db_name="genaiexeco-development",
+        checkpoint_collection_name="langgraph_checkpoints"
+    )
+    logger.info("✅ Using MongoDB for persistent conversation checkpoints.")
     
     workflow = StateGraph(AgentState)
     
@@ -881,7 +1349,7 @@ def create_workflow():
     # The formatter is the true final step before END
     workflow.add_edge("format_output", END)
     
-    checkpointer = MemorySaver()
+    #checkpointer = MemorySaver()
     graph = workflow.compile(checkpointer=checkpointer)
     
     logger.info("✅ Structured output workflow compiled successfully")
@@ -928,31 +1396,31 @@ def process_question(graph, question: str, thread_id: str):
         return {"answer": final_json_output, "time": f"{processing_time:.2f}s"}
 def interactive_mode(graph, mongodb_executor):
     thread_id = str(uuid.uuid4())
-    print(f"\n🎯 INTERACTIVE MODE - New conversation started (Thread ID: {thread_id}). Type 'quit' to exit.")
-    print(f"🔗 MongoDB: {'✅ Connected' if mongodb_executor.connected else '❌ Disconnected'}")
+    print(f"\n[INTERACTIVE] New conversation started (Thread ID: {thread_id}). Type 'quit' to exit.")
+    print(f"[MongoDB]: {'Connected' if mongodb_executor.connected else 'Disconnected'}")
     print("=" * 60)
 
     while True:
         try:
-            question = input("\n💬 Ask a question: ").strip()
+            question = input("\n> Ask a question: ").strip()
             if question.lower() in ['quit', 'exit', 'q']:
                 break
             if not question: continue
             
-            print("🔄 Processing...")
+            print("[Processing...]")
             # We no longer pass or receive state here. The checkpointer handles it all.
             result = process_question(graph, question, thread_id)
             
-            print(f"\n✅ Answer:")
+            print(f"\n[Answer]:")
             print(json.dumps(result['answer'], indent=4))
-            print(f"\n📊 Time: {result['time']}")
+            print(f"\n[Time]: {result['time']}")
             
         except (KeyboardInterrupt, EOFError):
             break
         except Exception as e:
-            print(f"❌ Error in interactive loop: {e}")
+            print(f"[Error] in interactive loop: {e}")
             
-    print("👋 Goodbye!")
+    print("Goodbye!")
 
 # ==============================================================================
 # MAIN EXECUTION
