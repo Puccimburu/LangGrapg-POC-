@@ -757,7 +757,7 @@ class ChartData(BaseModel):
 
 class ChartComponent(BaseModel):
     type: Literal["chart"] = "chart"
-    chartType: Literal["bar", "line", "pie"]
+    chartType: Literal["bar", "line", "pie", "doughnut", "radar", "scatter"]
     data: ChartData
     
 class HtmlComponent(BaseModel):
@@ -790,6 +790,120 @@ class AgentState(TypedDict):
     route: str
     raw_data: Any # To hold the raw python objects (list of users, text, etc.)
     structured_output: Optional[List[Dict[str, Any]]] # The final JSON output
+
+# ==============================================================================
+# ENHANCED OUTPUT FORMAT DETECTION
+# ==============================================================================
+
+def identify_output_format(state: AgentState):
+    """Enhanced output format detection using detailed analysis"""
+    logger.info("🎯 Identifying optimal output format...")
+    question = state["question"].content
+    
+    system_message = SystemMessage(
+        content="""You are an expert analytical AI. Your primary function is to analyze a user's query and determine the most effective and appropriate format(s) for the response. Your goal is to select from a predefined list of formats to ensure the user's request is answered clearly and efficiently.
+
+        List of Allowed Output Formats:
+
+        Table
+        Bar Chart
+        Plain Text
+        Pie Chart
+        Line Chart
+        Doughnut Chart
+        Radar Chart
+        Scatter Chart
+        HTML
+
+        Core Instructions and Decision-Making Rules
+        You must analyze the user's query and select one or more formats from the list above. Follow these rules precisely:
+
+        Rule 1: The "Max One Chart" Rule
+        You can select a maximum of ONE chart type for any given response.
+        If multiple chart types could potentially work, choose the single most suitable one based on the nature of the data and the user's question. For example, for showing change over time, a Line Chart is superior to a Bar Chart.
+
+        Rule 2: Combining Formats
+        Plain Text is the default and can be combined with any other format. It should be used for explanations, summaries, definitions, or any non-structured textual response.
+        A Table can be combined with Plain Text and/or one chart.
+        HTML is a specialized format and should generally be selected only when the user explicitly asks for HTML code or a complex, formatted layout like a resume or web page structure. It can be combined with Plain Text for explanation.
+
+        Guidelines for Selecting Each Format
+        Use the following logic to decide which format(s) to choose. Analyze the query for keywords and intent.
+
+        Non-Chart Formats
+        Plain Text:
+        When to use: For any question requiring a textual explanation, definition, list, code snippet, or conversational answer. This is the base format for most queries.
+        Keywords: "what is," "explain," "how to," "list," "describe," "generate code for..."
+
+        Table:
+        When to use: For presenting structured data with clear rows and columns. Ideal for direct comparisons of features across multiple items.
+        Keywords: "compare," "list features," "data for," "vs," "side-by-side."
+
+        HTML:
+        When to use: When the user explicitly requests HTML code or a web-based layout.
+        Keywords: "HTML for," "create a webpage," "HTML boilerplate," "format a resume in HTML."
+
+        Chart Formats (Remember: Max One!)
+        Bar Chart:
+        When to use: To compare distinct quantities across different categories. Excellent for ranking.
+        Keywords: "compare," "rank," "which has more/less," "vs" (for quantities).
+        Example: "Compare the box office revenue of the top 5 highest-grossing movies."
+
+        Line Chart:
+        When to use: To show a trend or changes in data over a continuous interval, most commonly time.
+        Keywords: "trend," "over time," "growth," "change," "fluctuation," "history."
+        Example: "Show the population growth of India from 1950 to today."
+
+        Pie Chart / Doughnut Chart:
+        When to use: To show the proportions or percentage breakdown of a whole. Use when parts sum to 100%. (These two are often interchangeable; select one).
+        Keywords: "proportion," "percentage," "share," "breakdown," "composition."
+        Example: "What is the market share of different operating systems?"
+
+        Scatter Chart:
+        When to use: To display the relationship or correlation between two different numerical variables.
+        Keywords: "relationship between," "correlation," "does X affect Y," "distribution."
+        Example: "Is there a relationship between hours of sleep and test scores?"
+
+        Radar Chart:
+        When to use: To compare multiple quantitative variables for one or more subjects. Ideal for showing strengths and weaknesses or performance profiles.
+        Keywords: "compare features of," "performance analysis," "strengths and weaknesses."
+        Example: "Compare two smartphones across battery life, camera quality, screen brightness, and price."
+
+        Output Requirement
+        Your final output must be a comma-separated list of the chosen format(s). Do not add any explanation.
+
+        Examples
+        User Query: "What is the capital of France?"
+        Your Output: Plain Text
+
+        User Query: "Compare the population, GDP, and area of the USA, China, and India."
+        Your Output: Plain Text, Table, Bar Chart
+
+        User Query: "Show me the trend of Google's stock price over the last 5 years."
+        Your Output: Plain Text, Line Chart
+
+        User Query: "Give me the HTML code for a basic contact form."
+        Your Output: Plain Text, HTML
+
+        User Query: "Show the percentage breakdown of Earth's atmosphere by gas."
+        Your Output: Plain Text, Pie Chart"""
+    )
+
+    human_message = HumanMessage(content=f"\n\nOriginal question: {question}")
+    
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0, google_api_key=GEMINI_API_KEY)
+    
+    try:
+        response = llm.invoke([system_message, human_message])
+        output_format = response.content.strip()
+        logger.info(f"🎯 Enhanced format detected: {output_format}")
+        state["output_format"] = output_format
+        return state
+    except Exception as e:
+        logger.warning(f"⚠️ Enhanced format detection failed, defaulting to Plain Text. Error: {e}")
+        state["output_format"] = "Plain Text"
+        return state
+
 # ==============================================================================
 # WORKFLOW NODES
 # ==============================================================================
@@ -844,15 +958,7 @@ def internal_search_node(state: AgentState, retriever, rag_chain, llm, mongodb_e
     chat_history = format_chat_history(state["messages"])
     
     logger.info("... 1/4: Detecting output format")
-    format_detector = llm.with_structured_output(OutputFormat)
-    format_prompt = f"Based on the user's question, what is the best output format? Question: '{question}'"
-    try:
-        format_result = format_detector.invoke(format_prompt)
-        state["output_format"] = format_result.format
-        logger.info(f"... Format detected: {state['output_format']}")
-    except Exception as e:
-        logger.warning(f"⚠️ Format detection failed, defaulting to JSON. Error: {e}")
-        state["output_format"] = "json"
+    state = identify_output_format(state)
 
     logger.info("... 2/4: Retrieving context")
     documents = retriever.invoke(question)
@@ -877,10 +983,10 @@ def internal_search_node(state: AgentState, retriever, rag_chain, llm, mongodb_e
                 if state["output_format"] == "table":
                     final_answer = _format_as_table(result['results'])
                 elif state["output_format"] == "natural_language":
-                    summary_prompt = f"Summarize the following JSON results in a friendly, natural language response. Results:\n{json.dumps(result['results'][:5], indent=2)}"
+                    summary_prompt = f"Summarize the following JSON results in a friendly, natural language response. Results:\n{json.dumps(result['results'][:5], indent=2, default=json_converter)}"
                     final_answer = llm.invoke(summary_prompt).content
                 else: # Default to JSON
-                    final_answer = f"```json\n{json.dumps(result['results'][:5], indent=2)}\n```"
+                    final_answer = f"```json\n{json.dumps(result['results'][:5], indent=2, default=json_converter)}\n```"
 
                 enhanced_response = f"""🎯 **Query Executed Successfully!**
 **Collection:** `{result['collection']}`
@@ -1055,7 +1161,7 @@ def handle_follow_up_node(state: AgentState, mongodb_executor, llm):
             state["follow_up_context"] = None
             return state
 
-        query_str = json.dumps(query_template)
+        query_str = json.dumps(query_template, default=json_converter)
 
         if "<user_input_needed>" in query_str:
             logger.info("... Query requires user input. Extracting...")
@@ -1197,13 +1303,23 @@ def format_output_node(state: AgentState, llm):
     6. Generate ONLY the final JSON output containing a list of these components, following the example format precisely.
     
     CRITICAL CHART FORMATTING RULES:
-    - For PIE charts: Use separate arrays: {{"labels": ["admin", "user", "legal"], "datasets": [{{"data": [[4, 1, 1]]}}]}}
-    - For BAR/LINE charts: Same format as pie charts with matching array lengths
-    - ALWAYS ensure labels array length EXACTLY matches data array length
+    - For PIE/DOUGHNUT charts: Use separate arrays: {{"labels": ["admin", "user", "legal"], "datasets": [{{"data": [4, 1, 1]}}]}}
+    - For BAR/LINE charts: Same format as pie charts with matching array lengths  
+    - For RADAR charts: Use same format but ensure all datasets have same number of data points as labels
+    - For SCATTER charts: Use datasets with x,y coordinate pairs: {{"datasets": [{{"data": [{{"x": 1, "y": 2}}, {{"x": 3, "y": 4}}]}}]}}
+    - ALWAYS ensure labels array length EXACTLY matches data array length (except scatter)
     - Extract labels from data: if data is [{{"role": "admin", "count": 4}}], labels should be ["admin"]
-    - Extract values from data: if data is [{{"role": "admin", "count": 4}}], values should be [[4]]
+    - Extract values from data: if data is [{{"role": "admin", "count": 4}}], values should be [4]
     - NEVER use object arrays like [{{"role": "admin", "count": 4}}] directly in chart data
     - Line charts should only be used for time-series or continuous data, NOT categorical data
+    
+    ENHANCED FORMAT SUPPORT:
+    - The user's output_format may contain multiple formats like "Plain Text, Table, Bar Chart"
+    - Parse the format string and create appropriate components for each format requested
+    - Always include Plain Text as a text component when specified
+    - Create table components when "Table" is specified
+    - Create chart components when any chart type is specified
+    - Create HTML components when "HTML" is specified
     """
     
     try:
@@ -1317,9 +1433,10 @@ def create_workflow():
     
     workflow = StateGraph(AgentState)
     
-    # Add all nodes
+    # Add all nodes  
     workflow.add_node("pre_router", pre_router_node)
     workflow.add_node("classify", lambda state: question_classifier(state, llm))
+    workflow.add_node("identify_format", identify_output_format)
     workflow.add_node("internal_search", lambda state: internal_search_node(state, retriever, rag_chain, llm, mongodb_executor))
     workflow.add_node("external_search", lambda state: external_search_node(state, llm))
     workflow.add_node("off_topic", off_topic_response)
@@ -1337,7 +1454,8 @@ def create_workflow():
     # Define the new graph structure
     workflow.set_entry_point("pre_router")
     workflow.add_conditional_edges("pre_router", route_from_pre_router, {"handle_follow_up": "handle_follow_up", "classify": "classify"})
-    workflow.add_conditional_edges("classify", route_from_classification, {"internal": "internal_search", "external": "external_search", "off_topic": "off_topic"})
+    workflow.add_edge("classify", "identify_format")
+    workflow.add_conditional_edges("identify_format", route_from_classification, {"internal": "internal_search", "external": "external_search", "off_topic": "off_topic"})
     
     # CORRECTED WIRING
     workflow.add_edge("internal_search", "generate_follow_up")
@@ -1412,7 +1530,7 @@ def interactive_mode(graph, mongodb_executor):
             result = process_question(graph, question, thread_id)
             
             print(f"\n[Answer]:")
-            print(json.dumps(result['answer'], indent=4))
+            print(json.dumps(result['answer'], indent=4, default=json_converter))
             print(f"\n[Time]: {result['time']}")
             
         except (KeyboardInterrupt, EOFError):
