@@ -28,6 +28,7 @@ if not GEMINI_API_KEY:
 
 # Core imports
 import pymongo
+import msgpack
 from bson import ObjectId
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
@@ -1415,6 +1416,143 @@ def fuzzy_match_role(user_input: str, available_roles: List[str]) -> Optional[st
     return None
 
 # ==============================================================================
+# CONVERSATION MANAGEMENT
+# ==============================================================================
+
+def list_previous_conversations(mongo_client):
+    """List all previous conversation threads with basic info"""
+    try:
+        db = mongo_client["genaiexeco-development"]
+        checkpoints = db["langgraph_checkpoints"]
+        
+        # Get unique thread_ids with their latest checkpoint info
+        pipeline = [
+            {"$sort": {"updated_at": -1}},
+            {"$group": {
+                "_id": "$thread_id",
+                "latest_update": {"$first": "$updated_at"},
+                "created_at": {"$first": "$created_at"},
+                "checkpoint_count": {"$sum": 1}
+            }},
+            {"$sort": {"latest_update": -1}},
+            {"$limit": 10}  # Show last 10 conversations
+        ]
+        
+        conversations = list(checkpoints.aggregate(pipeline))
+        return conversations
+    except Exception as e:
+        logger.error(f"Error listing conversations: {e}")
+        return []
+
+def get_conversation_summary(thread_id: str, mongo_client):
+    """Get a summary of a conversation including first and last messages"""
+    try:
+        db = mongo_client["genaiexeco-development"]
+        checkpoints = db["langgraph_checkpoints"]
+        
+        # Get the latest checkpoint for this thread
+        latest_checkpoint = checkpoints.find_one(
+            {"thread_id": thread_id},
+            sort=[("updated_at", -1)]
+        )
+        
+        if not latest_checkpoint:
+            return None
+            
+        # Extract messages if available - decode msgpack data
+        checkpoint_binary = latest_checkpoint.get("checkpoint")
+        if checkpoint_binary:
+            try:
+                # Handle both Binary objects and raw bytes
+                if hasattr(checkpoint_binary, 'binary'):
+                    data_to_decode = checkpoint_binary.binary
+                else:
+                    data_to_decode = checkpoint_binary
+                    
+                checkpoint_data = msgpack.unpackb(data_to_decode, raw=False)
+                channel_values = checkpoint_data.get("channel_values", {})
+                messages = channel_values.get("messages", [])
+            except Exception as e:
+                logger.error(f"Error decoding checkpoint data: {e}")
+                messages = []
+                channel_values = {}
+        else:
+            messages = []
+            channel_values = {}
+        
+        summary = {
+            "thread_id": thread_id,
+            "updated_at": latest_checkpoint.get("updated_at"),
+            "created_at": latest_checkpoint.get("created_at"),
+            "message_count": len(messages),
+            "first_message": None,
+            "last_message": None,
+            "last_response": None
+        }
+        
+        if messages:
+            # Find first human message
+            human_messages = [msg for msg in messages if isinstance(msg, dict) and msg.get("type") == "human"]
+            if human_messages:
+                summary["first_message"] = human_messages[0].get("content", "")[:100]
+            
+            # Find last AI message  
+            ai_messages = [msg for msg in messages if isinstance(msg, dict) and msg.get("type") == "ai"]
+            if ai_messages:
+                last_ai_content = ai_messages[-1].get("content", "")
+                summary["last_message"] = last_ai_content[:100]
+        
+        # Get structured output if available
+        structured_output = channel_values.get("structured_output", [])
+        if structured_output:
+            summary["last_response"] = structured_output
+            
+        return summary
+    except Exception as e:
+        logger.error(f"Error getting conversation summary: {e}")
+        return None
+
+def get_last_response_from_thread(thread_id: str, mongo_client):
+    """Get the last structured response from a specific conversation thread"""
+    try:
+        db = mongo_client["genaiexeco-development"]
+        checkpoints = db["langgraph_checkpoints"]
+        
+        # Find the latest checkpoint with structured_output
+        pipeline = [
+            {"$match": {"thread_id": thread_id}},
+            {"$sort": {"updated_at": -1}},
+            {"$limit": 1}
+        ]
+        
+        latest_checkpoint = list(checkpoints.aggregate(pipeline))
+        if not latest_checkpoint:
+            return None
+            
+        # Decode msgpack checkpoint data
+        checkpoint_binary = latest_checkpoint[0].get("checkpoint")
+        if checkpoint_binary:
+            try:
+                # Handle both Binary objects and raw bytes
+                if hasattr(checkpoint_binary, 'binary'):
+                    data_to_decode = checkpoint_binary.binary
+                else:
+                    data_to_decode = checkpoint_binary
+                    
+                checkpoint_data = msgpack.unpackb(data_to_decode, raw=False)
+                channel_values = checkpoint_data.get("channel_values", {})
+                structured_output = channel_values.get("structured_output", [])
+                return structured_output if structured_output else None
+            except Exception as e:
+                logger.error(f"Error decoding checkpoint for last response: {e}")
+                return None
+        else:
+            return None
+    except Exception as e:
+        logger.error(f"Error getting last response: {e}")
+        return None
+
+# ==============================================================================
 # WORKFLOW COMPILATION
 # ==============================================================================
 
@@ -1514,8 +1652,15 @@ def process_question(graph, question: str, thread_id: str):
         return {"answer": final_json_output, "time": f"{processing_time:.2f}s"}
 def interactive_mode(graph, mongodb_executor):
     thread_id = str(uuid.uuid4())
+    mongo_client = pymongo.MongoClient(MONGODB_URI)
+    
     print(f"\n[INTERACTIVE] New conversation started (Thread ID: {thread_id}). Type 'quit' to exit.")
     print(f"[MongoDB]: {'Connected' if mongodb_executor.connected else 'Disconnected'}")
+    print("\n[COMMANDS]:")
+    print("  /list - Show previous conversations")
+    print("  /resume <thread_id> - Resume a previous conversation")
+    print("  /last <thread_id> - Get last response from a conversation")
+    print("  /help - Show this help message")
     print("=" * 60)
 
     while True:
@@ -1524,6 +1669,71 @@ def interactive_mode(graph, mongodb_executor):
             if question.lower() in ['quit', 'exit', 'q']:
                 break
             if not question: continue
+            
+            # Handle special commands
+            if question.startswith('/'):
+                command_parts = question.split()
+                command = command_parts[0].lower()
+                
+                if command == '/help':
+                    print("\n[COMMANDS]:")
+                    print("  /list - Show previous conversations")
+                    print("  /resume <thread_id> - Resume a previous conversation")
+                    print("  /last <thread_id> - Get last response from a conversation")
+                    print("  /help - Show this help message")
+                    print("  quit/exit/q - Exit the program")
+                    continue
+                    
+                elif command == '/list':
+                    print("\n[PREVIOUS CONVERSATIONS]:")
+                    conversations = list_previous_conversations(mongo_client)
+                    if not conversations:
+                        print("No previous conversations found.")
+                    else:
+                        for i, conv in enumerate(conversations, 1):
+                            thread_id_short = conv['_id'][:8]
+                            update_time = conv.get('latest_update', 'Unknown')
+                            checkpoint_count = conv.get('checkpoint_count', 0)
+                            print(f"  {i}. {thread_id_short}... ({checkpoint_count} messages) - {update_time}")
+                            print(f"     Full ID: {conv['_id']}")
+                    continue
+                    
+                elif command == '/resume':
+                    if len(command_parts) < 2:
+                        print("[Error] Usage: /resume <thread_id>")
+                        continue
+                    
+                    resume_thread_id = command_parts[1]
+                    # Check if conversation exists
+                    summary = get_conversation_summary(resume_thread_id, mongo_client)
+                    if summary:
+                        thread_id = resume_thread_id
+                        print(f"\n[RESUMED] Conversation {thread_id[:8]}...")
+                        print(f"Messages: {summary['message_count']}")
+                        if summary['first_message']:
+                            print(f"First message: {summary['first_message']}")
+                        print("You can now continue the conversation.")
+                    else:
+                        print(f"[Error] Conversation {resume_thread_id} not found.")
+                    continue
+                    
+                elif command == '/last':
+                    if len(command_parts) < 2:
+                        print("[Error] Usage: /last <thread_id>")
+                        continue
+                    
+                    target_thread_id = command_parts[1]
+                    last_response = get_last_response_from_thread(target_thread_id, mongo_client)
+                    if last_response:
+                        print(f"\n[LAST RESPONSE from {target_thread_id[:8]}...]:")
+                        print(json.dumps(last_response, indent=4, default=json_converter))
+                    else:
+                        print(f"[Error] No response found for conversation {target_thread_id}")
+                    continue
+                    
+                else:
+                    print(f"[Error] Unknown command: {command}. Type /help for available commands.")
+                    continue
             
             print("[Processing...]")
             # We no longer pass or receive state here. The checkpointer handles it all.
