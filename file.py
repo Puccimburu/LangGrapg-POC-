@@ -946,7 +946,9 @@ When in doubt, classify as 'internal'.""")
     structured_llm = llm.with_structured_output(QuestionClassification)
     result = structured_llm.invoke([system_msg, HumanMessage(content=question)])
     
-    state["on_topic"] = result.classification
+    # Normalize classification to match routing expectations
+    classification = result.classification.replace("-", "_")  # Convert "off-topic" to "off_topic"
+    state["on_topic"] = classification
     logger.info(f"🎯 AI Classification: {state['on_topic']}")
     return state
 
@@ -1420,7 +1422,7 @@ def fuzzy_match_role(user_input: str, available_roles: List[str]) -> Optional[st
 # ==============================================================================
 
 def list_previous_conversations(mongo_client):
-    """List all previous conversation threads with basic info"""
+    """List all previous conversation threads with rich context"""
     try:
         db = mongo_client["genaiexeco-development"]
         checkpoints = db["langgraph_checkpoints"]
@@ -1432,14 +1434,133 @@ def list_previous_conversations(mongo_client):
                 "_id": "$thread_id",
                 "latest_update": {"$first": "$updated_at"},
                 "created_at": {"$first": "$created_at"},
-                "checkpoint_count": {"$sum": 1}
+                "checkpoint_count": {"$sum": 1},
+                "latest_checkpoint": {"$first": "$$ROOT"}
             }},
             {"$sort": {"latest_update": -1}},
             {"$limit": 10}  # Show last 10 conversations
         ]
         
         conversations = list(checkpoints.aggregate(pipeline))
-        return conversations
+        
+        # Enhance each conversation with context
+        enhanced_conversations = []
+        for i, conv in enumerate(conversations, 1):
+            thread_id = conv['_id']
+            
+            # Extract context from latest checkpoint
+            latest_checkpoint = conv.get('latest_checkpoint', {})
+            checkpoint_binary = latest_checkpoint.get("checkpoint")
+            
+            conv_data = {
+                'number': i,
+                'thread_id': thread_id,
+                'thread_id_short': thread_id[:8],
+                'latest_update': conv.get('latest_update', 'Unknown'),
+                'message_count': conv.get('checkpoint_count', 0),
+                'title': 'Untitled Conversation',
+                'first_message': None,
+                'last_message': None,
+                'last_response_type': None
+            }
+            
+            # Decode checkpoint to get conversation context
+            if checkpoint_binary:
+                try:
+                    # Handle both Binary objects and raw bytes
+                    if hasattr(checkpoint_binary, 'binary'):
+                        data_to_decode = checkpoint_binary.binary
+                    else:
+                        data_to_decode = checkpoint_binary
+                        
+                    checkpoint_data = msgpack.unpackb(data_to_decode, raw=False)
+                    channel_values = checkpoint_data.get("channel_values", {})
+                    messages = channel_values.get("messages", [])
+                    structured_output = channel_values.get("structured_output", [])
+                    
+                    if messages:
+                        # Extract human messages - handle both dict and ExtType formats
+                        first_human_content = None
+                        last_ai_content = None
+                        
+                        for msg in messages:
+                            try:
+                                if isinstance(msg, dict):
+                                    # Simple dict format
+                                    if msg.get("type") == "human" and not first_human_content:
+                                        first_human_content = msg.get("content", "")
+                                    elif msg.get("type") == "ai":
+                                        last_ai_content = msg.get("content", "")
+                                elif hasattr(msg, 'data') and hasattr(msg, 'code'):
+                                    # msgpack ExtType - try to parse the data
+                                    try:
+                                        # The ExtType contains serialized LangChain message data
+                                        # For now, we'll extract from the raw bytes if possible
+                                        data_str = msg.data.decode('utf-8', errors='ignore')
+                                        if 'human' in data_str.lower() and not first_human_content:
+                                            # Look for content pattern in the serialized data
+                                            import re
+                                            # Try multiple patterns to extract clean content
+                                            patterns = [
+                                                r'content\x94([a-zA-Z][a-zA-Z0-9\s,.\?!\'"-]+?)[\x80\x94\xa0]',  # Pattern with msgpack delimiters
+                                                r'content\x94([a-zA-Z][a-zA-Z0-9\s,.\?!\'"-]+)',  # Simpler pattern
+                                                r'content.([a-zA-Z][a-zA-Z0-9\s,.\?!\'"-]{5,50})'  # Fallback pattern
+                                            ]
+                                            
+                                            for pattern in patterns:
+                                                try:
+                                                    content_match = re.search(pattern, data_str)
+                                                    if content_match:
+                                                        extracted_content = content_match.group(1).strip()
+                                                        # Additional cleaning - remove common msgpack artifacts
+                                                        clean_content = re.sub(r'(additional.*|_kwargs.*|metadata.*)', '', extracted_content, flags=re.IGNORECASE).strip()
+                                                        if clean_content and len(clean_content) > 3 and not clean_content.startswith('_'):
+                                                            first_human_content = clean_content
+                                                            break
+                                                except:
+                                                    continue
+                                        elif 'ai' in data_str.lower():
+                                            # Similar extraction for AI messages
+                                            content_match = re.search(r'content.([^\\]+)', data_str)
+                                            if content_match:
+                                                extracted = content_match.group(1)
+                                                # Take first reasonable portion
+                                                if len(extracted) > 10:
+                                                    last_ai_content = extracted[:200]
+                                    except:
+                                        pass  # Skip if can't parse
+                                elif hasattr(msg, 'content') and hasattr(msg, 'type'):
+                                    # Direct LangChain message object
+                                    if msg.type == "human" and not first_human_content:
+                                        first_human_content = msg.content
+                                    elif msg.type == "ai":
+                                        last_ai_content = msg.content
+                            except Exception as e:
+                                logger.debug(f"Error parsing message: {e}")
+                                continue
+                        
+                        if first_human_content:
+                            conv_data['first_message'] = first_human_content[:60] + "..." if len(first_human_content) > 60 else first_human_content
+                            # Generate friendly title from first message
+                            title_words = first_human_content.split()[:5]  # First 5 words
+                            conv_data['title'] = " ".join(title_words).title()
+                        
+                        if last_ai_content:
+                            conv_data['last_message'] = last_ai_content[:60] + "..." if len(last_ai_content) > 60 else last_ai_content
+                    
+                    # Check what type of output was generated
+                    if structured_output:
+                        output_types = [comp.get('type', 'unknown') for comp in structured_output if isinstance(comp, dict)]
+                        unique_types = list(set(output_types))
+                        if unique_types:
+                            conv_data['last_response_type'] = ", ".join(unique_types)
+                    
+                except Exception as e:
+                    logger.debug(f"Could not decode checkpoint context for {thread_id}: {e}")
+            
+            enhanced_conversations.append(conv_data)
+        
+        return enhanced_conversations
     except Exception as e:
         logger.error(f"Error listing conversations: {e}")
         return []
@@ -1654,12 +1775,15 @@ def interactive_mode(graph, mongodb_executor):
     thread_id = str(uuid.uuid4())
     mongo_client = pymongo.MongoClient(MONGODB_URI)
     
+    # Store conversation list for numeric selection
+    cached_conversations = []
+    
     print(f"\n[INTERACTIVE] New conversation started (Thread ID: {thread_id}). Type 'quit' to exit.")
     print(f"[MongoDB]: {'Connected' if mongodb_executor.connected else 'Disconnected'}")
     print("\n[COMMANDS]:")
     print("  /list - Show previous conversations")
-    print("  /resume <thread_id> - Resume a previous conversation")
-    print("  /last <thread_id> - Get last response from a conversation")
+    print("  /resume <number|thread_id> - Resume a previous conversation")
+    print("  /last <number|thread_id> - Get last response from a conversation")
     print("  /help - Show this help message")
     print("=" * 60)
 
@@ -1676,56 +1800,127 @@ def interactive_mode(graph, mongodb_executor):
                 command = command_parts[0].lower()
                 
                 if command == '/help':
-                    print("\n[COMMANDS]:")
-                    print("  /list - Show previous conversations")
-                    print("  /resume <thread_id> - Resume a previous conversation")
-                    print("  /last <thread_id> - Get last response from a conversation")
-                    print("  /help - Show this help message")
-                    print("  quit/exit/q - Exit the program")
+                    print("\n[CONVERSATION COMMANDS]:")
+                    print("  /list                    - Show recent conversations with context")
+                    print("  /resume <number|id>      - Resume a conversation (e.g., '/resume 1' or '/resume 94cfd818...')")
+                    print("  /last <number|id>        - Get the final response from a conversation")
+                    print("  /help                    - Show this help message")
+                    print("  quit/exit/q              - Exit the program")
+                    print("\n[TIPS]:")
+                    print("  * Use '/list' first to see numbered conversations")
+                    print("  * Use numbers for easier access: '/resume 1' instead of long IDs")
+                    print("  * All previous context is preserved when resuming conversations")
+                    print("  * You can switch between conversations anytime during a session")
                     continue
                     
                 elif command == '/list':
-                    print("\n[PREVIOUS CONVERSATIONS]:")
+                    print("\n[RECENT CONVERSATIONS]:")
                     conversations = list_previous_conversations(mongo_client)
+                    cached_conversations = conversations  # Cache for numeric selection
+                    
                     if not conversations:
                         print("No previous conversations found.")
                     else:
-                        for i, conv in enumerate(conversations, 1):
-                            thread_id_short = conv['_id'][:8]
-                            update_time = conv.get('latest_update', 'Unknown')
-                            checkpoint_count = conv.get('checkpoint_count', 0)
-                            print(f"  {i}. {thread_id_short}... ({checkpoint_count} messages) - {update_time}")
-                            print(f"     Full ID: {conv['_id']}")
+                        for conv in conversations:
+                            num = conv['number']
+                            title = conv['title']
+                            short_id = conv['thread_id_short']
+                            msg_count = conv['message_count']
+                            update_time = conv['latest_update']
+                            first_msg = conv['first_message']
+                            response_type = conv['last_response_type']
+                            
+                            print(f"\n  {num}. [{title}]")
+                            print(f"     ID: {short_id}... | {msg_count} messages | {update_time}")
+                            if first_msg:
+                                print(f"     Question: \"{first_msg}\"")
+                            if response_type:
+                                print(f"     Generated: {response_type}")
+                        
+                        print(f"\n[TIP] Use '/resume <number>' (e.g., '/resume 1') or '/resume <full_id>' to continue a conversation")
+                        print(f"[TIP] Use '/last <number>' to see the final response from any conversation")
                     continue
                     
                 elif command == '/resume':
                     if len(command_parts) < 2:
-                        print("[Error] Usage: /resume <thread_id>")
+                        print("[Error] Usage: /resume <number|thread_id>")
+                        print("Example: /resume 1  or  /resume 94cfd818-b235-4dfa-a259-dc80ccbed1fe")
                         continue
                     
-                    resume_thread_id = command_parts[1]
-                    # Check if conversation exists
+                    resume_input = command_parts[1]
+                    resume_thread_id = None
+                    
+                    # Check if input is a number (referencing cached conversations)
+                    if resume_input.isdigit():
+                        conv_number = int(resume_input)
+                        if cached_conversations and 1 <= conv_number <= len(cached_conversations):
+                            resume_thread_id = cached_conversations[conv_number - 1]['thread_id']
+                            conv_title = cached_conversations[conv_number - 1]['title']
+                        else:
+                            print(f"[Error] Invalid conversation number. Use '/list' to see available conversations (1-{len(cached_conversations) if cached_conversations else 0})")
+                            continue
+                    else:
+                        # Direct thread ID
+                        resume_thread_id = resume_input
+                        conv_title = "Unknown"
+                    
+                    # Get detailed conversation summary
                     summary = get_conversation_summary(resume_thread_id, mongo_client)
                     if summary:
                         thread_id = resume_thread_id
-                        print(f"\n[RESUMED] Conversation {thread_id[:8]}...")
-                        print(f"Messages: {summary['message_count']}")
-                        if summary['first_message']:
-                            print(f"First message: {summary['first_message']}")
-                        print("You can now continue the conversation.")
+                        print(f"\n[RESUMED] {conv_title}")
+                        print(f"   Thread: {thread_id[:8]}...")
+                        print(f"   Messages: {summary['message_count']}")
+                        print(f"   Last active: {summary.get('updated_at', 'Unknown')}")
+                        
+                        if summary.get('first_message'):
+                            print(f"   Started with: \"{summary['first_message']}\"")
+                        if summary.get('last_message'):
+                            print(f"   Last response: \"{summary['last_message'][:80]}...\"")
+                        if summary.get('last_response'):
+                            response_types = [comp.get('type', 'unknown') for comp in summary['last_response'] if isinstance(comp, dict)]
+                            if response_types:
+                                print(f"   Last output: {', '.join(set(response_types))}")
+                        
+                        print(f"\n[OK] You can now continue this conversation. All previous context is maintained.")
                     else:
                         print(f"[Error] Conversation {resume_thread_id} not found.")
                     continue
                     
                 elif command == '/last':
                     if len(command_parts) < 2:
-                        print("[Error] Usage: /last <thread_id>")
+                        print("[Error] Usage: /last <number|thread_id>")
+                        print("Example: /last 1  or  /last 94cfd818-b235-4dfa-a259-dc80ccbed1fe")
                         continue
                     
-                    target_thread_id = command_parts[1]
+                    last_input = command_parts[1]
+                    target_thread_id = None
+                    conv_title = "Unknown"
+                    
+                    # Check if input is a number (referencing cached conversations)
+                    if last_input.isdigit():
+                        conv_number = int(last_input)
+                        if cached_conversations and 1 <= conv_number <= len(cached_conversations):
+                            target_thread_id = cached_conversations[conv_number - 1]['thread_id']
+                            conv_title = cached_conversations[conv_number - 1]['title']
+                        else:
+                            print(f"[Error] Invalid conversation number. Use '/list' to see available conversations (1-{len(cached_conversations) if cached_conversations else 0})")
+                            continue
+                    else:
+                        # Direct thread ID
+                        target_thread_id = last_input
+                    
                     last_response = get_last_response_from_thread(target_thread_id, mongo_client)
                     if last_response:
-                        print(f"\n[LAST RESPONSE from {target_thread_id[:8]}...]:")
+                        print(f"\n[LAST RESPONSE] {conv_title}")
+                        print(f"   From: {target_thread_id[:8]}...")
+                        
+                        # Show response summary before full output
+                        response_types = [comp.get('type', 'unknown') for comp in last_response if isinstance(comp, dict)]
+                        component_count = len(last_response)
+                        print(f"   Contains: {component_count} components ({', '.join(set(response_types))})")
+                        
+                        print(f"\n[Full Response]:")
                         print(json.dumps(last_response, indent=4, default=json_converter))
                     else:
                         print(f"[Error] No response found for conversation {target_thread_id}")
