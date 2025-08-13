@@ -989,11 +989,11 @@ def internal_search_node(state: AgentState, retriever, rag_chain, llm, mongodb_e
                     summary_prompt = f"Summarize the following JSON results in a friendly, natural language response. Results:\n{json.dumps(result['results'][:5], indent=2, default=json_converter)}"
                     final_answer = llm.invoke(summary_prompt).content
                 else: # Default to JSON
-                    final_answer = f"```json\n{json.dumps(result['results'][:5], indent=2, default=json_converter)}\n```"
+                    final_answer = f"```json\n{json.dumps(result['results'], indent=2, default=json_converter)}\n```"
 
                 enhanced_response = f"""🎯 **Query Executed Successfully!**
 **Collection:** `{result['collection']}`
-**Records Found:** {result['count']} (showing up to 5)
+**Records Found:** {result['count']}
 
 **📊 RESULTS ({state['output_format'].replace('_', ' ').title()}):**
 {final_answer}"""
@@ -1249,122 +1249,119 @@ def format_output_node(state: AgentState, llm):
         state["structured_output"] = final_components
         return state
 
-    # Prepare the formatter LLM
-    formatter_llm = llm.with_structured_output(StructuredResponse)
+    # Note: Using raw LLM approach as it's more reliable than structured output
     
-    # Prepare the prompt
-    prompt = f"""You are a data visualization expert. Your job is to convert raw data into a structured JSON format for a UI, based on the user's question.
-    Choose the best component(s) (table, chart, text, html) to display the information.
+    # Prepare the prompt with better structure and clearer instructions
+    prompt = f"""You are a data visualization expert. Your job is to convert raw data into a structured JSON format for a UI.
 
-    ---
-    EXAMPLE OUTPUT FORMAT:
-    {{
-        "components": [
-            {{
-                "type": "table",
-                "headers": ["Product", "Sales"],
-                "rows": [
-                    ["Widget A", 150],
-                    ["Widget B", 200]
-                ]
-            }},
-            {{
-                "type": "chart",
-                "chartType": "pie",
-                "data": {{
-                    "labels": ["admin", "user", "legal"],
-                    "datasets": [
-                        {{
-                            "label": "User Count by Role",
-                            "data": [4.0, 1.0, 1.0]
-                        }}
-                    ]
-                }}
-            }},
-            {{
-                "type": "text",
-                "content": "Widget B is the top seller this quarter."
-            }}
-        ]
-    }}
-    ---
+CRITICAL: You MUST return ONLY a valid JSON object starting with {{ and ending with }}.
 
-    USER'S QUESTION:
-    "{state['question'].content}"
+EXAMPLE OUTPUT FORMAT:
+{{
+    "components": [
+        {{
+            "type": "table",
+            "headers": ["promptId", "promptName", "description"],
+            "rows": [
+                ["448f0675", "Term And Duration", "Term And Duration"],
+                ["04d5e6f7", "End User Definition", "How are end users defined"]
+            ]
+        }},
+        {{
+            "type": "text",
+            "content": "Follow-up question text goes here"
+        }}
+    ]
+}}
 
-    RAW DATA (in Python/JSON format - LIMITED TO FIRST 10 ITEMS):
-    {json.dumps(raw_data[:10] if isinstance(raw_data, list) else raw_data, indent=2, default=json_converter)}
+USER'S QUESTION: "{state['question'].content}"
 
-    Follow-up question to include (if any): "{state.get('follow_up_question', 'NONE')}"
+RAW DATA: {json.dumps(raw_data if isinstance(raw_data, list) else raw_data, indent=2, default=json_converter)}
 
-    INSTRUCTIONS:
-    1. Analyze the user's question and the raw data.
-    2. If the data is tabular (a list of objects), a "table" component is best.
-    3. If the data is aggregated or statistical, a "chart" is a good choice.
-    4. If the data is just text, use a "text" component.
-    5. If there is a follow-up question to ask the user, add it as a final "text" component.
-    6. Generate ONLY the final JSON output containing a list of these components, following the example format precisely.
-    
-    CRITICAL CHART FORMATTING RULES:
-    - For PIE/DOUGHNUT charts: Use separate arrays: {{"labels": ["admin", "user", "legal"], "datasets": [{{"data": [4, 1, 1]}}]}}
-    - For BAR/LINE charts: Same format as pie charts with matching array lengths  
-    - For RADAR charts: Use same format but ensure all datasets have same number of data points as labels
-    - For SCATTER charts: Use datasets with x,y coordinate pairs: {{"datasets": [{{"data": [{{"x": 1, "y": 2}}, {{"x": 3, "y": 4}}]}}]}}
-    - ALWAYS ensure labels array length EXACTLY matches data array length (except scatter)
-    - Extract labels from data: if data is [{{"role": "admin", "count": 4}}], labels should be ["admin"]
-    - Extract values from data: if data is [{{"role": "admin", "count": 4}}], values should be [4]
-    - NEVER use object arrays like [{{"role": "admin", "count": 4}}] directly in chart data
-    - Line charts should only be used for time-series or continuous data, NOT categorical data
-    
-    ENHANCED FORMAT SUPPORT:
-    - The user's output_format may contain multiple formats like "Plain Text, Table, Bar Chart"
-    - Parse the format string and create appropriate components for each format requested
-    - Always include Plain Text as a text component when specified
-    - Create table components when "Table" is specified
-    - Create chart components when any chart type is specified
-    - Create HTML components when "HTML" is specified
-    """
+Follow-up question: "{state.get('follow_up_question', 'NONE')}"
+
+INSTRUCTIONS:
+1. For list data like prompts/users: Use "table" component with appropriate headers and rows
+2. For aggregate data: Use "chart" component 
+3. Always include follow-up as separate "text" component with "content" field if not "NONE"
+4. CRITICAL: Text components MUST use "content" field, NOT "text" field
+5. Return ONLY valid JSON - no explanations, no markdown, no extra text
+
+JSON OUTPUT:"""
     
     try:
-            # We need a separate LLM instance that does NOT have structured output for the raw call.
-            raw_llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0, google_api_key=GEMINI_API_KEY)
-            
-            # Get the raw string response from the LLM
-            raw_response_content = raw_llm.invoke(prompt).content
-            
-            logger.info(f"... Raw LLM Response for formatting:\n{raw_response_content}")
+        # Use raw LLM with improved parsing (more reliable than structured output)
+        raw_llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0, google_api_key=GEMINI_API_KEY)
+        raw_response_content = raw_llm.invoke(prompt).content
+        
+        logger.info(f"... Raw LLM Response for formatting:\n{raw_response_content}")
+        logger.info(f"... Response type: {type(raw_response_content)}")
 
-            # Attempt to find and parse a JSON object from the raw response
+        # Multiple JSON extraction strategies
+        json_str = None
+        
+        # Strategy 1: Look for complete JSON object
+        json_start = raw_response_content.find('{')
+        json_end = raw_response_content.rfind('}') + 1
+        
+        if json_start != -1 and json_end > json_start:
+            json_str = raw_response_content[json_start:json_end]
+        
+        # Strategy 2: Try to extract from code blocks
+        if not json_str:
+            import re
+            json_blocks = re.findall(r'```(?:json)?\s*(\{.*?\})\s*```', raw_response_content, re.DOTALL)
+            if json_blocks:
+                json_str = json_blocks[0]
+        
+        # Strategy 3: Use the whole response if it looks like JSON
+        if not json_str and raw_response_content.strip().startswith('{'):
+            json_str = raw_response_content.strip()
+        
+        if json_str:
             try:
-                # Find the start and end of the JSON blob
-                json_start = raw_response_content.find('{')
-                json_end = raw_response_content.rfind('}') + 1
+                parsed_json = json.loads(json_str)
                 
-                if json_start != -1 and json_end != -1:
-                    json_str = raw_response_content[json_start:json_end]
-                    
-                    # Parse the string into a Python dictionary
-                    parsed_json = json.loads(json_str)
-                    
-                    # Now, validate this dictionary against our Pydantic model
-                    validated_response = StructuredResponse.model_validate(parsed_json)
-                    
-                    # Convert the validated Pydantic models back to a list of dicts
-                    final_components = [component.model_dump() for component in validated_response.components]
-                    state["structured_output"] = final_components
-                    logger.info("... ✅ Successfully parsed and validated structured JSON output.")
-                else:
-                    # This happens if the LLM response does not contain any JSON object.
-                    raise ValueError("Could not find a valid JSON object in the LLM response.")
-
+                # Fix common field name issues
+                if "components" in parsed_json:
+                    for component in parsed_json["components"]:
+                        if component.get("type") == "text" and "text" in component and "content" not in component:
+                            component["content"] = component.pop("text")
+                
+                validated_response = StructuredResponse.model_validate(parsed_json)
+                final_components = [component.model_dump() for component in validated_response.components]
+                state["structured_output"] = final_components
+                logger.info("... ✅ Successfully parsed and validated JSON from raw response.")
+                return state
             except (json.JSONDecodeError, ValueError) as e:
-                logger.warning(f"⚠️ Initial parsing failed: {e}. Falling back to a text component.")
-                # Fallback: if parsing fails, just wrap the whole raw response in a text component.
-                state["structured_output"] = [{"type": "text", "content": raw_response_content}]
+                logger.warning(f"⚠️ JSON parsing failed: {e}")
+        
+        # Final fallback: Create simple table from raw data
+        if isinstance(raw_data, list) and raw_data:
+            if isinstance(raw_data[0], dict):
+                headers = list(raw_data[0].keys())
+                rows = [[str(item.get(h, '')) for h in headers] for item in raw_data]
+                fallback_components = [{
+                    "type": "table",
+                    "headers": headers,
+                    "rows": rows
+                }]
+                if state.get('follow_up_question', 'NONE') != 'NONE':
+                    fallback_components.append({
+                        "type": "text",
+                        "content": f"Follow-up: {state['follow_up_question']}"
+                    })
+                state["structured_output"] = fallback_components
+                logger.info("... ✅ Used fallback table generation.")
+                return state
+
+        # Last resort: plain text
+        state["structured_output"] = [{"type": "text", "content": raw_response_content}]
+        logger.warning("... ⚠️ Using plain text fallback.")
 
     except Exception as e:
-            logger.error(f"❌ Critical failure in format_output_node: {e}", exc_info=True)
-            state["structured_output"] = [{"type": "text", "content": f"Error formatting output: {str(e)}"}]
+        logger.error(f"❌ Critical failure in format_output_node: {e}", exc_info=True)
+        state["structured_output"] = [{"type": "text", "content": f"Error formatting output: {str(e)}"}]
     
     return state
 
